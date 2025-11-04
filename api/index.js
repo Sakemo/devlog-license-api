@@ -5,13 +5,12 @@ const { status } = require('express/lib/response');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 const app = express();
-app.use(express.json());
 app.use('/api/stripe-webhook', express.raw({ type: 'application/json' }));
 app.use(express.json);
 
 const redis = new Redis(process.env.REDIS_URL, { lazyConnect: true });
 
-// --- ENDPOINT 1: Gerar Licença (Protegido por Segredo) ---
+// ENDPOINT: Generate License
 app.post('/api/generate-license', async (req, res) => {
     const { secret, email } = req.body;
     if (secret !== process.env.GENERATION_SECRET_KEY) {
@@ -30,7 +29,7 @@ app.post('/api/generate-license', async (req, res) => {
     }
 });
 
-// --- ENDPOINT 2: Verificar Licença (Público, chamado pela extensão) ---
+//ENDPOINT: verify license
 app.post('/api/verify-license', async (req, res) => {
     const { licenseKey } = req.body;
     if (!licenseKey) {
@@ -99,7 +98,7 @@ app.post('/api/stripe-webhook', async (req, res) => {
     if(event.type === 'checkout.session.completed') {
         const session = event.data.object;
 
-        if (session.payment.status === 'paid') {
+        if (session.payment_status === 'paid') {
             const customerEmail = session.customer_details.email;
 
             if (!customerEmail){
