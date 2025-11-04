@@ -1,14 +1,14 @@
-// api/index.js
 const express = require('express');
 const { v4: uuidv4 } = require('uuid');
 const Redis = require('ioredis');
+const { status } = require('express/lib/response');
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 const app = express();
 app.use(express.json());
+app.use('/api/stripe-webhook', express.raw({ type: 'application/json' }));
+app.use(express.json);
 
-// 1. Inicializa o cliente Redis a partir da variável de ambiente
-// A biblioteca 'ioredis' entende a string de conexão da Vercel/Upstash nativamente.
-// A opção 'lazyConnect: true' é uma boa prática em ambientes serverless.
 const redis = new Redis(process.env.REDIS_URL, { lazyConnect: true });
 
 // --- ENDPOINT 1: Gerar Licença (Protegido por Segredo) ---
@@ -21,24 +21,9 @@ app.post('/api/generate-license', async (req, res) => {
         return res.status(400).json({ error: 'Email is required' });
     }
 
-    const licenseKey = `DEVLOG-${uuidv4().toUpperCase()}`;
-    const licenseData = {
-        email: email,
-        createdAt: new Date().toISOString(),
-        status: 'active',
-    };
-
     try {
-        // 2. Armazena a chave no Redis
-        // 'set' no ioredis: chave, valor (stringificado), e 'EX' para expiração (opcional)
-        await redis.set(licenseKey, JSON.stringify(licenseData));
-        // Criamos um índice reverso para encontrar a chave pelo email, se necessário
-        await redis.set(`email:${email}`, licenseKey);
-
-        console.log(`Generated license ${licenseKey} for ${email}`);
-        
-        return res.status(200).json({ licenseKey: licenseKey });
-
+        const { licenseKey } = await createAndStoreLicense(email, redis);
+        return res.status(200).json({ licenseKey });
     } catch (error) {
         console.error("Error generating license:", error);
         return res.status(500).json({ error: 'Internal server error' });
@@ -53,14 +38,12 @@ app.post('/api/verify-license', async (req, res) => {
     }
 
     try {
-        // 3. Busca a chave no Redis
         const result = await redis.get(licenseKey);
 
         if (!result) {
             return res.status(404).json({ valid: false, reason: 'License not found' });
         }
 
-        // 'result' é uma string, precisamos fazer o parse
         const licenseData = JSON.parse(result);
 
         if (licenseData.status === 'active') {
@@ -75,5 +58,66 @@ app.post('/api/verify-license', async (req, res) => {
     }
 });
 
-// Exporta o app para a Vercel (sem mudanças aqui)
+async function createAndStoreLicense(email, redis) {
+    const existingLicenseKey = await redis.get(`email:${email}`);
+    if(existingLicenseKey) {
+        console.log(`License alreade exists for ${email}. Returning existing key: ${existingLicenseKey}`);
+        return { licenseKey: existingLicenseKey, isNew: false };
+    }
+
+    const licenseKey = `DEVLOG-${uuidv4().toUpperCase()}`;
+    const licenseData = {
+        email: email,
+        createdAt: new Date().toISOString(),
+        status: 'active',
+        source: 'stripe'
+    };
+
+    await redis.multi()
+        .set(licenseKey, JSON.stringify(licenseData))
+        .set(`email:${email}`, licenseKey)
+        .exec();
+
+    console.log(`Generated new license ${licenseKey} for ${email} via Stripe`);
+    return {licenseKey, isNew: true};
+}
+
+// ENDPOINT: Stripe Webhook (public)
+app.post('/api/stripe-webhook', async (req, res) => {
+    const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
+    const sig = req.headers['stripe-signature'];
+
+    let event;
+
+    try {
+        event = stripe.webhooks.constructEvent(req.body, sig, endpointSecret);
+    } catch (err) {
+        console.error(`Webhook signature verification failed`, err.message);
+        return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    if(event.type === 'checkout.session.completed') {
+        const session = event.data.object;
+
+        if (session.payment.status === 'paid') {
+            const customerEmail = session.customer_details.email;
+
+            if (!customerEmail){
+                console.error("Checkout session completed without customer email");
+                return res.status(400).json({ error: 'Customer email not found' });
+            }
+
+            try {
+                const { licenseKey } = await createAndStoreLicense(customerEmail, redis);
+
+                console.log(`Sucessfully processed license for ${customerEmail}. KEY: ${licenseKey}`);
+            } catch (error) {
+                console.error("Error processing license after payment:", error);
+                return res.status(500).json({ error: 'Internal server error during license generation' })
+            }
+        }
+    }
+    res.status(200).json({ received: true });
+})
+
 module.exports = app;
